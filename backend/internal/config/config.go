@@ -1,9 +1,11 @@
 package config
 
 import (
-	"github.com/joho/godotenv"
 	"log"
 	"os"
+	"strings"
+
+	"github.com/joho/godotenv"
 )
 
 type config struct {
@@ -15,9 +17,11 @@ var (
 )
 
 func loadConfig() error {
-	if err := godotenv.Load(); err != nil {
-		log.Println("Error loading .env file: ", err)
-		return err
+	if strings.ToLower(os.Getenv("IS_DOCKER")) == "false" {
+		if err := godotenv.Load(); err != nil {
+			log.Println("Error loading .env file: ", err)
+			return err
+		}
 	}
 
 	AppConfig.ModelPath = os.Getenv("MODEL_PATH")

@@ -1,0 +1,22 @@
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: backend
+    environment:
+      IS_DOCKER: true
+      MODEL_PATH: "/models/ggml-tiny-q5_1.bin"
+    ports:
+      - "8888:8010"
+    volumes:
+      - "/Users/asparkoffire/models/extra:/models"
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: frontend
+    environment:
+      VITE_WEBSOCKET_URL: "ws://localhost:8888/api/v1/transcribe/ws"
+    ports:
+      - "3000:5173"
