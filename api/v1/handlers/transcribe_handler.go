@@ -2,140 +2,106 @@ package handlers
 
 import (
 	"errors"
+	"github.com/asparkoffire/whisper-go/pkg/whisper"
 	"github.com/asparkoffire/whisper-speech-transcribe/api"
-	"github.com/asparkoffire/whisper-speech-transcribe/internal/config"
-	"github.com/asparkoffire/whisper-speech-transcribe/internal/transcriber"
-	"github.com/gorilla/websocket"
-	"io"
-
-	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
+	"sync/atomic"
+
+	"github.com/asparkoffire/whisper-speech-transcribe/internal/config"
+	"github.com/asparkoffire/whisper-speech-transcribe/internal/service"
+	"github.com/asparkoffire/whisper-speech-transcribe/internal/transcriber"
+	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 )
 
-// HandleFileUploadTranscribe handles audio file uploads and returns transcription
-func HandleFileUploadTranscribe(c *gin.Context) error {
-	// Load Whisper model
-	whisperTranscriber, err := transcriber.NewWhisperTranscriber(config.AppConfig.ModelPath)
-	if err != nil {
-		log.Println("Error creating WhisperTranscriber:", err)
-		return api.Error{
-			Code: http.StatusInternalServerError,
-			Err:  "Failed to initialize transcriber",
-		}
+var (
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
 	}
-	defer whisperTranscriber.Unload(c)
+	jobIDCounter int32 = 0
+)
 
-	// Parse the uploaded file
-	file, _, err := c.Request.FormFile("file")
-	if err != nil {
-		log.Println("Error retrieving file:", err)
-		return api.Error{
-			Code: http.StatusBadRequest,
-			Err:  "Invalid audio file",
-		}
-	}
-	defer file.Close()
-
-	// Read file content into memory
-	audioData, err := io.ReadAll(file)
-	if err != nil {
-		log.Println("Error reading audio file:", err)
-		return api.Error{
-			Code: http.StatusInternalServerError,
-			Err:  "Failed to read audio file",
-		}
-	}
-
-	// Transcribe audio
-	segments, err := whisperTranscriber.TranscribeFromBytes(c, audioData)
-	if err != nil {
-		log.Println("Error during transcription:", err)
-		return api.Error{
-			Code: http.StatusInternalServerError,
-			Err:  "Error during transcription",
-		}
-	}
-
-	// Respond with transcription
-	return api.Response{
-		Code: http.StatusOK,
-		Msg:  "Successfully transcribed",
-		Data: segments,
-	}
+type TranscribeHandler struct {
+	Pool *service.Pool
+	Jobs chan service.Job
 }
 
-// HandleWebSocketTranscribe WebSocket handler for transcription that processes audio chunks in real-time
-func HandleWebSocketTranscribe(c *gin.Context) {
+func NewTranscribeHandler() (*TranscribeHandler, error) {
+	tr, err := transcriber.NewWhisperTranscriber(config.AppConfig.ModelPath)
+	if err != nil {
+		log.Printf("Error creating transcriber handler: %v", err)
+		return nil, err
+	}
+
+	jobs := make(chan service.Job, 100)
+	pool := service.NewPool(tr)
+	pool.Start(4, jobs) // Start 4 workers
+
+	return &TranscribeHandler{
+		Jobs: jobs,
+		Pool: pool,
+	}, nil
+}
+
+func (h *TranscribeHandler) HandleWebSocketTranscribe(c *gin.Context) {
+	// Init transcriber
 	whisperTranscriber, err := transcriber.NewWhisperTranscriber(config.AppConfig.ModelPath)
 	if err != nil {
 		log.Println("Error creating WhisperTranscriber:", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize transcriber"})
 		return
 	}
 	defer whisperTranscriber.Unload(c)
 
-	// Upgrade the connection to WebSocket using Gorilla WebSocket
-	upgrader := websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool {
-			return true // Allow all connections (be cautious with production)
-		},
-	}
-
+	// WebSocket upgrade
 	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
-		log.Println("Error upgrading to WebSocket:", err)
+		log.Println("WebSocket upgrade error:", err)
 		return
 	}
 	defer conn.Close()
 
-	// Channel for handling errors in reading or writing WebSocket messages
-	errChan := make(chan error)
-
-	// Goroutine to continuously read WebSocket messages (audio chunks)
-	go func() {
-		for {
-			// Read a chunk of audio data from the WebSocket
-			_, p, err := conn.ReadMessage()
-			if err != nil {
-				if !errors.Is(err, websocket.ErrCloseSent) {
-					log.Println("Error reading message from WebSocket:", err)
-					errChan <- err // send the error to the main goroutine
-				}
-				break
+	// Listen for audio chunks
+	for {
+		_, audioData, err := conn.ReadMessage()
+		if err != nil {
+			if !errors.Is(err, websocket.ErrCloseSent) {
+				log.Println("WebSocket read error:", err)
 			}
+			break
+		}
 
-			// Process the audio chunk immediately in a separate goroutine
-			// Transcribe the audio chunk
-			segments, err := whisperTranscriber.TranscribeFromBytes(c, p)
-			if err != nil {
-				log.Println("Error during transcription:", err)
-				errChan <- err // send the error to the main goroutine
-				return
-			}
+		resultChan := make(chan []whisper.Segment)
+		errorChan := make(chan error)
 
-			// Send the transcription result back for this chunk
-			for _, segment := range segments {
-				err := conn.WriteJSON(segment)
-				if err != nil {
-					log.Println("Error sending WebSocket message:", err)
-					errChan <- err // send the error to the main goroutine
+		job := service.Job{
+			ID:         int(atomic.AddInt32(&jobIDCounter, 1)),
+			Payload:    audioData,
+			Ctx:        c, // Pass request context
+			ResultChan: resultChan,
+			ErrorChan:  errorChan,
+		}
+
+		h.Jobs <- job
+
+		// Handle job result or error
+		select {
+		case result := <-resultChan:
+			for _, segment := range result {
+				if err := conn.WriteJSON(segment); err != nil {
+					log.Println("Error sending transcription segment:", err)
 					return
 				}
 			}
-		}
-	}()
-
-	// Wait until the WebSocket connection is closed or an error occurs
-	select {
-	case <-c.Request.Context().Done():
-		log.Println("WebSocket connection closed")
-	case err := <-errChan:
-		if err != nil {
-			log.Println("Error in WebSocket communication:", err)
+		case err := <-errorChan:
+			log.Println("Transcription error:", err)
 			conn.WriteJSON(api.Error{
 				Code: http.StatusInternalServerError,
-				Err:  "Internal server error during transcription",
+				Err:  "Transcription failed",
+				Data: err.Error(),
 			})
+			continue
 		}
 	}
 }

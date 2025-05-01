@@ -24,10 +24,11 @@ func NewWhisperTranscriber(modelPath string) (Transcriber, error) {
 }
 
 func (t *WhisperTranscriber) TranscribeFromFile(ctx context.Context, filePath string) ([]whisper.Segment, error) {
-	context, err := t.model.NewContext()
+	modelContext, err := t.model.NewContext()
 	if err != nil {
 		return nil, err
 	}
+	modelContext.SetInitialPrompt("You are a professional interviewer conducting a structured job interview. evaluate the candidate's responses, communication skills, and cultural fit.")
 
 	// Read and preprocess the WAV file: convert to mono, 16kHz
 	intSamples, _, err := utils.ReadWAVFromFile(filePath, 16000, true)
@@ -38,13 +39,13 @@ func (t *WhisperTranscriber) TranscribeFromFile(ctx context.Context, filePath st
 	// Convert int samples to float32
 	samples := intToFloat32(intSamples)
 
-	if err := context.Process(samples, nil, nil, nil); err != nil {
+	if err := modelContext.Process(samples, nil, nil, nil); err != nil {
 		return nil, err
 	}
 
 	var segments []whisper.Segment
 	for {
-		segment, err := context.NextSegment()
+		segment, err := modelContext.NextSegment()
 		if err != nil {
 			break
 		}
